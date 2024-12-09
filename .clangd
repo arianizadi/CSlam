@@ -1,0 +1,10 @@
+CompileFlags:
+  Add: [-std=c++20]
+
+Diagnostics:
+  ClangTidy:
+    Add:
+      - clang-analyzer*
+      - hicpp*
+      - misc*
+      - bugprone*
