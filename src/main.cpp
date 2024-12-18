@@ -1,4 +1,5 @@
 #include <chrono>
+#include <climits>
 #include <iostream>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
@@ -33,41 +34,57 @@ Mat processFrame(Mat& frame1, Mat& frame2) {
   Mat K = calculateIntrinsics(gray1);
 
   Ptr< ORB > orb = orb->create();
+  orb->setMaxFeatures(1000);
+  orb->setPatchSize(31);
+
   vector< KeyPoint > keypoints1, keypoints2;
   Mat descriptor1, descriptor2;
 
   orb->detectAndCompute(gray1, noArray(), keypoints1, descriptor1);
   orb->detectAndCompute(gray2, noArray(), keypoints2, descriptor2);
 
-  BFMatcher bfMatcher;
-  bfMatcher.create(NORM_HAMMING, true);
+  BFMatcher bfMatcher(NORM_HAMMING);
+  vector< vector< DMatch > > knnMatches;
+  bfMatcher.knnMatch(descriptor1, descriptor2, knnMatches, 2);
 
-  vector< DMatch > matches;
-  bfMatcher.match(descriptor1, descriptor2, matches);
+  vector< DMatch > goodMatches;
+  float ratio = 0.6;
+  for(const auto& knnMatch : knnMatches) {
+    if(knnMatch.size() >= 2
+       && knnMatch[0].distance < ratio * knnMatch[1].distance) {
+      goodMatches.push_back(knnMatch[0]);
+    }
+  }
 
-  vector< DMatch > inlierMatches;
   vector< Point2f > points1, points2;
-  for(const auto& match : matches) {
+  for(const auto& match : goodMatches) {
     points1.emplace_back(keypoints1[match.queryIdx].pt);
     points2.emplace_back(keypoints2[match.trainIdx].pt);
   }
 
   vector< uchar > inlierMask;
-  findFundamentalMat(points1, points2, FM_RANSAC, 3, 0.99, inlierMask);
-  for(int i = 0; i < inlierMask.size(); ++i) {
-    if(inlierMask[i]) {
-      inlierMatches.emplace_back(matches[i]);
-    }
+  if(!points1.empty() && !points2.empty()) {
+    findFundamentalMat(points1, points2, FM_RANSAC, 3, 0.99, inlierMask);
   }
 
-  drawMatches(frame1, keypoints1, frame2, keypoints2, matches, resFrame);
+  Mat matchesImg;
+  drawMatches(frame1,
+              keypoints1,
+              frame2,
+              keypoints2,
+              goodMatches,
+              matchesImg,
+              Scalar(0, 255, 0), // Color for good matches (Green)
+              Scalar(0, 0, 255), // Color for single points (Red)
+              vector< char >(),
+              DrawMatchesFlags::DEFAULT);
 
-  return resFrame;
+  return matchesImg;
 }
 
 int main() {
   std::string video_path
-      = "/Users/arianizadi/Documents/Projects/Koshee/CSlam/data/drive2.webm";
+      = "/Users/arianizadi/Documents/Projects/Koshee/CSlam/data/drive1.webm";
   VideoCapture cap(video_path);
 
   if(!cap.isOpened()) {
@@ -76,13 +93,19 @@ int main() {
   }
 
   double fps = 0;
+  int frame = 0;
   std::chrono::time_point< std::chrono::high_resolution_clock > start, end;
 
   Mat currentFrame, previousFrame;
   cap >> previousFrame;
 
-  while(cap.read(currentFrame)) {
+  Size frameDim = Size(960, 540);
+
+  while(cap.read(currentFrame) && frame < INT_MAX) {
     start = std::chrono::high_resolution_clock::now();
+
+    resize(currentFrame, currentFrame, frameDim);
+    resize(previousFrame, previousFrame, frameDim);
 
     Mat resFrame = processFrame(previousFrame, currentFrame);
 
@@ -100,11 +123,28 @@ int main() {
 
     imshow("Live", resFrame);
 
-    if(waitKey(5) >= 0) {
+    // Escape to exit
+    // Space to toggle pause
+    int spaceKey = 32;
+    int escapeKey = 27;
+
+    int key = waitKey(5);
+    if(key == escapeKey) {
       break;
+    } else if(key == spaceKey) {
+      while(true) {
+        int key2 = waitKey(5);
+        if(key2 == spaceKey) {
+          break;
+        } else if(key2 == escapeKey) {
+          return 0;
+        }
+      }
     }
 
     previousFrame = currentFrame;
+
+    ++frame;
   }
 
   return 0;
