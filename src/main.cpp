@@ -11,13 +11,26 @@
 #include <opencv2/videoio.hpp>
 
 using namespace cv;
-using std::cout, std::endl, std::cerr, std::vector;
+using std::cerr, std::vector, std::cout, std::endl;
+
+Mat calculateIntrinsics(Mat& frame) {
+  double fx = frame.cols;
+  double fy = fx;
+  double cx = frame.cols / 2.0;
+  double cy = frame.rows / 2.0;
+
+  Mat K = (Mat_< double >(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+
+  return K;
+}
 
 Mat processFrame(Mat& frame1, Mat& frame2) {
   Mat resFrame, gray1, gray2;
 
   cvtColor(frame1, gray1, COLOR_BGR2GRAY);
   cvtColor(frame2, gray2, COLOR_BGR2GRAY);
+
+  Mat K = calculateIntrinsics(gray1);
 
   Ptr< ORB > orb = orb->create();
   vector< KeyPoint > keypoints1, keypoints2;
@@ -66,7 +79,6 @@ int main() {
   std::chrono::time_point< std::chrono::high_resolution_clock > start, end;
 
   Mat currentFrame, previousFrame;
-
   cap >> previousFrame;
 
   while(cap.read(currentFrame)) {
