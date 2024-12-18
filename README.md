@@ -3,6 +3,8 @@
 ## Preprocessing
 - [x] **Read Video**: Implemented using `cv::VideoCapture` to load video frames sequentially.
 - [x] **Grayscale Conversion**: Implemented using `cv::cvtColor` to convert frames to grayscale.
+- [x] **Gaussian Blur**: Applied Gaussian smoothing to reduce noise in frames.
+- [x] **Histogram Equalization**: Enhanced contrast in frames using histogram equalization.
 - [ ] **Synchronize Cameras**: If using multiple cameras, ensure temporal synchronization of frames.
 
 ## Feature Detection and Matching

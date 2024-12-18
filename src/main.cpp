@@ -31,17 +31,27 @@ Mat processFrame(Mat& frame1, Mat& frame2) {
   cvtColor(frame1, gray1, COLOR_BGR2GRAY);
   cvtColor(frame2, gray2, COLOR_BGR2GRAY);
 
+  GaussianBlur(gray1, gray1, Size(3, 3), 0);
+  GaussianBlur(gray2, gray2, Size(3, 3), 0);
+  equalizeHist(gray1, gray1);
+  equalizeHist(gray2, gray2);
+
   Mat K = calculateIntrinsics(gray1);
 
   Ptr< ORB > orb = orb->create();
-  orb->setMaxFeatures(1000);
-  orb->setPatchSize(31);
+  orb->setMaxFeatures(100);
 
   vector< KeyPoint > keypoints1, keypoints2;
   Mat descriptor1, descriptor2;
 
   orb->detectAndCompute(gray1, noArray(), keypoints1, descriptor1);
   orb->detectAndCompute(gray2, noArray(), keypoints2, descriptor2);
+
+  if(keypoints1.size() < 5 || keypoints2.size() < 5 || descriptor1.empty()
+     || descriptor2.empty()) {
+    cerr << "Not enough keypoints or descriptors. Skipping frame." << endl;
+    return frame1.clone();
+  }
 
   BFMatcher bfMatcher(NORM_HAMMING);
   vector< vector< DMatch > > knnMatches;
@@ -77,14 +87,15 @@ Mat processFrame(Mat& frame1, Mat& frame2) {
               Scalar(0, 255, 0), // Color for good matches (Green)
               Scalar(0, 0, 255), // Color for single points (Red)
               vector< char >(),
-              DrawMatchesFlags::DEFAULT);
+              DrawMatchesFlags::DEFAULT
+                  | DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
 
   return matchesImg;
 }
 
 int main() {
   std::string video_path
-      = "/Users/arianizadi/Documents/Projects/Koshee/CSlam/data/drive1.webm";
+      = "/Users/arianizadi/Documents/Projects/Koshee/CSlam/data/snow.webm";
   VideoCapture cap(video_path);
 
   if(!cap.isOpened()) {
