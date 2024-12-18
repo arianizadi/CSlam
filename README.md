@@ -8,8 +8,8 @@
 ## Feature Detection and Matching
 - [x] **Feature Extraction**: Used ORB to detect keypoints and descriptors in frames.
 - [x] **Feature Matching**: Implemented using `BFMatcher` with the Hamming norm.
-- [ ] **Feature Selection**:
-  - [ ] Apply Lowe’s ratio test to retain reliable matches.
+- [x] **Feature Selection**:
+  - [x] Apply Lowe’s ratio test to retain reliable matches.
   - [x] Filter matches using geometric constraints like the Fundamental Matrix with RANSAC.
 
 ## Pose Estimation
