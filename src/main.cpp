@@ -91,13 +91,17 @@ void processFrameAndUpdatePose(
   int inliers = recoverPose(E, points1, points2, K, R, t, mask);
 }
 
-int main() {
-  std::string video_path
-      = "/Users/arianizadi/Documents/Projects/Koshee/CSlam/data/drive2.webm";
+int main(int argc, char** argv) {
+  if(argc != 2) {
+    cerr << "Usage: " << argv[0] << " <video_path>" << endl;
+    return -1;
+  }
+
+  std::string video_path = argv[1];
   VideoCapture cap(video_path);
 
   if(!cap.isOpened()) {
-    cerr << "ERROR! Unable to open video\n";
+    cerr << "ERROR! Unable to open video: " << video_path << endl;
     return -1;
   }
 
