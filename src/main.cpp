@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <chrono>
 #include <climits>
+#include <deque>
 #include <iostream>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
@@ -9,11 +11,75 @@
 #include <opencv2/features2d.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/video.hpp> // For KLT tracker
 #include <opencv2/videoio.hpp>
 #include <opencv2/viz.hpp>
 
 using namespace cv;
 using std::cerr, std::vector, std::cout, std::endl;
+
+// Camera path smoother class
+class CameraPathSmoother {
+private:
+  const int bufferSize;
+  std::deque< Affine3d > poses;
+  Affine3d lastSmoothedPose;
+
+public:
+  CameraPathSmoother(int buffSize = 10) : bufferSize(buffSize) {
+    lastSmoothedPose = Affine3d::Identity();
+  }
+
+  void addPose(const Mat& R, const Mat& t) {
+    Mat Rt = Mat::eye(4, 4, CV_64F);
+    R.copyTo(Rt(Rect(0, 0, 3, 3)));
+    t.copyTo(Rt(Rect(3, 0, 1, 3)));
+
+    Affine3d pose(Rt);
+    poses.push_back(pose);
+
+    if(poses.size() > bufferSize) {
+      poses.pop_front();
+    }
+  }
+
+  Affine3d getSmoothedPose() {
+    if(poses.empty()) {
+      return Affine3d::Identity();
+    }
+
+    if(poses.size() == 1) {
+      lastSmoothedPose = poses[0];
+      return poses[0];
+    }
+
+    // Simple weighted average for translations
+    Vec3d avgTranslation(0, 0, 0);
+    double weightSum = 0;
+
+    for(size_t i = 0; i < poses.size(); i++) {
+      double weight = i + 1; // More weight to recent poses
+      avgTranslation += weight * poses[i].translation();
+      weightSum += weight;
+    }
+
+    avgTranslation = avgTranslation / weightSum;
+
+    // For rotation, simply use the most recent
+    Mat R = Mat(poses.back().rotation());
+
+    // Create new smoothed pose
+    Affine3d smoothedPose = Affine3d(R, avgTranslation);
+
+    // Temporal smoothing
+    Vec3d newT = 0.8 * smoothedPose.translation()
+                 + 0.2 * lastSmoothedPose.translation();
+    Affine3d temporallySmoothedPose(R, newT);
+
+    lastSmoothedPose = temporallySmoothedPose;
+    return temporallySmoothedPose;
+  }
+};
 
 Mat calculateIntrinsics(Mat& frame) {
   double fx = frame.cols;
@@ -25,70 +91,141 @@ Mat calculateIntrinsics(Mat& frame) {
   return K;
 }
 
-void processFrameAndUpdatePose(
-    Mat& frame1, Mat& frame2, Mat& R, Mat& t, Mat& K) {
-  Mat gray1, gray2;
-  cvtColor(frame1, gray1, COLOR_BGR2GRAY);
-  cvtColor(frame2, gray2, COLOR_BGR2GRAY);
+// Using KLT tracker instead of feature matching for better tracking in driving
+// videos
+bool trackFeatures(Mat& prevFrame,
+                   Mat& currFrame,
+                   vector< Point2f >& prevPoints,
+                   vector< Point2f >& currPoints,
+                   Mat& K,
+                   Mat& R,
+                   Mat& t) {
+  // Convert to grayscale
+  Mat prevGray, currGray;
+  cvtColor(prevFrame, prevGray, COLOR_BGR2GRAY);
+  cvtColor(currFrame, currGray, COLOR_BGR2GRAY);
 
-  GaussianBlur(gray1, gray1, Size(3, 3), 0);
-  GaussianBlur(gray2, gray2, Size(3, 3), 0);
-  equalizeHist(gray1, gray1);
-  equalizeHist(gray2, gray2);
+  // Initialize status and error vectors
+  vector< uchar > status;
+  vector< float > err;
 
-  Ptr< ORB > orb = ORB::create();
-  orb->setMaxFeatures(1000);
+  // If no previous points, detect features to track
+  if(prevPoints.empty()) {
+    // Use FAST detector to find corners
+    vector< KeyPoint > keypoints;
+    int maxCorners = 3000;
+    double qualityLevel = 0.01;
+    double minDistance = 7;
 
-  vector< KeyPoint > keypoints1, keypoints2;
-  Mat descriptor1, descriptor2;
+    // Try FAST first
+    FAST(prevGray, keypoints, 20, true);
 
-  orb->detectAndCompute(gray1, noArray(), keypoints1, descriptor1);
-  orb->detectAndCompute(gray2, noArray(), keypoints2, descriptor2);
+    // If not enough points, try goodFeaturesToTrack
+    if(keypoints.size() < 300) {
+      goodFeaturesToTrack(
+          prevGray, prevPoints, maxCorners, qualityLevel, minDistance);
+    } else {
+      KeyPoint::convert(keypoints, prevPoints);
+    }
 
-  if(keypoints1.size() < 8 || keypoints2.size() < 8) {
-    cerr << "Not enough keypoints. Skipping frame." << endl;
-    return;
-  }
-
-  BFMatcher matcher(NORM_HAMMING);
-  vector< vector< DMatch > > knnMatches;
-  matcher.knnMatch(descriptor1, descriptor2, knnMatches, 2);
-
-  vector< DMatch > goodMatches;
-  const float ratio = 0.7F;
-  for(const auto& knnMatch : knnMatches) {
-    if(knnMatch.size() >= 2
-       && knnMatch[0].distance < ratio * knnMatch[1].distance) {
-      goodMatches.push_back(knnMatch[0]);
+    // Refine corner locations
+    if(!prevPoints.empty()) {
+      cornerSubPix(
+          prevGray,
+          prevPoints,
+          Size(10, 10),
+          Size(-1, -1),
+          TermCriteria(TermCriteria::COUNT | TermCriteria::EPS, 20, 0.03));
     }
   }
 
-  if(goodMatches.size() < 8) {
-    cerr << "Not enough good matches. Skipping frame." << endl;
-    return;
+  // Early exit if no points to track
+  if(prevPoints.empty() || prevPoints.size() < 10) {
+    cerr << "Not enough points to track: "
+         << (prevPoints.empty() ? 0 : prevPoints.size()) << endl;
+    return false;
   }
 
-  vector< Point2f > points1, points2;
-  for(const auto& match : goodMatches) {
-    points1.push_back(keypoints1[match.queryIdx].pt);
-    points2.push_back(keypoints2[match.trainIdx].pt);
+  // Clear current points before tracking
+  currPoints.clear();
+
+  // Track points using Lucas-Kanade optical flow
+  calcOpticalFlowPyrLK(
+      prevGray,
+      currGray,
+      prevPoints,
+      currPoints,
+      status,
+      err,
+      Size(21, 21),
+      3,
+      TermCriteria(TermCriteria::COUNT | TermCriteria::EPS, 30, 0.01),
+      OPTFLOW_LK_GET_MIN_EIGENVALS);
+
+  // Filter tracked points using status
+  vector< Point2f > good_prev, good_curr;
+  for(size_t i = 0; i < status.size(); i++) {
+    if(status[i]) {
+      good_prev.push_back(prevPoints[i]);
+      good_curr.push_back(currPoints[i]);
+    }
   }
 
-  // Calculate Essential Matrix
-  Mat E = findEssentialMat(points1, points2, K, RANSAC, 0.999, 1.0);
-
-  if(E.empty()) {
-    cerr << "Failed to compute essential matrix. Skipping frame." << endl;
-    return;
+  // Check if we have enough points
+  if(good_prev.size() < 10) {
+    cerr << "Not enough good tracked points: " << good_prev.size() << endl;
+    return false;
   }
 
-  // Recover R and t from Essential Matrix
-  Mat tempR1, tempR2, tempT;
-  decomposeEssentialMat(E, tempR1, tempR2, tempT);
-
-  // Use recoverPose to get the correct R and t
+  // Filter out outliers with RANSAC
   Mat mask;
-  int inliers = recoverPose(E, points1, points2, K, R, t, mask);
+  try {
+    Mat E = findEssentialMat(good_prev, good_curr, K, RANSAC, 0.999, 1.0, mask);
+
+    if(E.empty()) {
+      cerr << "Failed to compute essential matrix" << endl;
+      return false;
+    }
+
+    // Extract inliers
+    vector< Point2f > inlier_prev, inlier_curr;
+    for(size_t i = 0; i < mask.rows; i++) {
+      if(mask.at< uchar >(i)) {
+        inlier_prev.push_back(good_prev[i]);
+        inlier_curr.push_back(good_curr[i]);
+      }
+    }
+
+    // Update tracked points for next frame
+    prevPoints = inlier_curr;
+
+    // Check inlier count
+    if(inlier_prev.size() < 8) {
+      cerr << "Not enough inliers: " << inlier_prev.size() << endl;
+      return false;
+    }
+
+    // Recover R and t from essential matrix
+    int inliers = recoverPose(E, inlier_prev, inlier_curr, K, R, t);
+
+    if(inliers < 8) {
+      cerr << "Not enough inliers from pose recovery: " << inliers << endl;
+      return false;
+    }
+
+    // Display tracked points
+    Mat display = currFrame.clone();
+    for(size_t i = 0; i < inlier_curr.size(); i++) {
+      circle(display, inlier_curr[i], 3, Scalar(0, 255, 0), -1);
+      line(display, inlier_prev[i], inlier_curr[i], Scalar(0, 0, 255), 1);
+    }
+    imshow("Tracked Points", display);
+
+    return true;
+  } catch(const cv::Exception& e) {
+    cerr << "OpenCV exception: " << e.what() << endl;
+    return false;
+  }
 }
 
 int main(int argc, char** argv) {
@@ -105,121 +242,204 @@ int main(int argc, char** argv) {
     return -1;
   }
 
+  // Get video properties
+  int frameWidth = cap.get(CAP_PROP_FRAME_WIDTH);
+  int frameHeight = cap.get(CAP_PROP_FRAME_HEIGHT);
+  double fps = cap.get(CAP_PROP_FPS);
+
+  cout << "Video: " << frameWidth << "x" << frameHeight << " @ " << fps
+       << " FPS" << endl;
+
+  // Setup downsampling for faster processing
+  Size frameDim(640, 360); // More aggressive downsampling for speed
+
+  // Create visualization window
   viz::Viz3d window("Camera Motion");
   window.setBackgroundColor(viz::Color::black());
+  window.showWidget("Coordinate Widget", viz::WCoordinateSystem(0.5));
+  window.showWidget("grid", viz::WGrid(Vec2i::all(10), Vec2d::all(1.0)));
 
-  window.showWidget("Coordinate Widget", viz::WCoordinateSystem(0.1));
-
-  viz::WCameraPosition cpw_frustum(Vec2f(0.9, 0.4), 0.15, viz::Color::yellow());
-  viz::WCameraPosition cpw_axes(0.1);
+  // Camera widgets
+  viz::WCameraPosition cpw_frustum(Vec2f(0.9, 0.6), 0.2, viz::Color::yellow());
+  viz::WCameraPosition cpw_axes(0.2);
   window.showWidget("CPW_FRUSTUM", cpw_frustum);
   window.showWidget("CPW_AXES", cpw_axes);
 
-  window.showWidget("grid", viz::WGrid(Vec2i::all(5), Vec2d::all(0.5)));
-
-  vector< Point3d > trajectory;
-  window.setWindowSize(Size(1280, 720));
+  // Window settings
+  window.setWindowSize(Size(800, 600));
   window.setViewerPose(
-      viz::makeCameraPose(Vec3d(0, -0.5, -2), Vec3d(0, 0, 0), Vec3d(0, -1, 0)));
+      viz::makeCameraPose(Vec3d(0, -2, -20), Vec3d(0, 0, 0), Vec3d(0, -1, 0)));
 
+  // Read first frame
   Mat currentFrame, previousFrame;
   cap >> previousFrame;
 
-  Size frameDim(960, 540);
+  if(previousFrame.empty()) {
+    cerr << "First frame is empty!" << endl;
+    return -1;
+  }
+
+  // Resize for faster processing
   resize(previousFrame, previousFrame, frameDim);
 
-  // Initialize camera parameters
+  // Camera intrinsics
   Mat K = calculateIntrinsics(previousFrame);
+  cout << "Camera matrix: " << K << endl;
 
-  // Initialize camera pose
+  // Initialize tracking
+  vector< Point2f > prevPoints; // Will be filled in trackFeatures
+  vector< Point2f > currPoints;
+
+  // Camera pose variables
   Mat R = Mat::eye(3, 3, CV_64F);
   Mat t = Mat::zeros(3, 1, CV_64F);
-  Mat currentR, currentT;
 
-  // Accumulated transformation
+  // Accumulated pose
   Mat accR = Mat::eye(3, 3, CV_64F);
   Mat accT = Mat::zeros(3, 1, CV_64F);
 
-  double fps = 0;
+  // Path smoothing
+  CameraPathSmoother pathSmoother(15);
+  vector< Point3d > trajectory;
+
+  // Frame counters
   int frameCount = 0;
-  std::chrono::time_point< std::chrono::high_resolution_clock > start, end;
+  int skipCount = 0;
+  int successCount = 0;
 
-  while(cap.read(currentFrame) && frameCount < INT_MAX) {
-    start = std::chrono::high_resolution_clock::now();
+  // Timing
+  auto startTime = std::chrono::high_resolution_clock::now();
 
+  // Enable skip ahead for driving videos
+  int frameSkip = 1; // Process every nth frame
+
+  // Process frames
+  while(frameCount < INT_MAX) {
+    // Skip frames if needed
+    for(int i = 0; i < frameSkip && cap.read(currentFrame); i++) {
+      // Just advance the video
+    }
+
+    // If we can't read any more frames, we're done
+    if(!cap.read(currentFrame) || currentFrame.empty()) {
+      break;
+    }
+
+    // Resize for faster processing
     resize(currentFrame, currentFrame, frameDim);
 
-    processFrameAndUpdatePose(
-        previousFrame, currentFrame, currentR, currentT, K);
+    // Track features
+    Mat frame_R, frame_t;
+    bool success = trackFeatures(previousFrame,
+                                 currentFrame,
+                                 prevPoints,
+                                 currPoints,
+                                 K,
+                                 frame_R,
+                                 frame_t);
 
-    if(!currentR.empty() && !currentT.empty()) {
-      // Scale down the translation
-      accT = accT + currentT * 0.01;
+    if(success) {
+      successCount++;
+
+      // Apply constant scale factor (adjust as needed for your video)
+      double scale = 0.1; // Larger scale for driving videos
+
+      // Scale the translation and accumulate
+      accT = accT + scale * (accR * frame_t);
 
       // Accumulate rotation
-      accR = currentR * accR;
+      accR = frame_R * accR;
 
-      // Create new camera pose
-      Mat pose = Mat::eye(4, 4, CV_64F);
-      accR.copyTo(pose(Rect(0, 0, 3, 3)));
-      accT.copyTo(pose(Rect(3, 0, 1, 3)));
+      // Add to path smoother
+      pathSmoother.addPose(accR, accT);
 
-      // Update camera widgets with new pose
-      Affine3d cameraPose(pose);
+      // Get smoothed pose for visualization
+      Affine3d cameraPose = pathSmoother.getSmoothedPose();
+
+      // Update visualization
       window.setWidgetPose("CPW_FRUSTUM", cameraPose);
       window.setWidgetPose("CPW_AXES", cameraPose);
 
-      // Add point to trajectory
-      trajectory.emplace_back(accT);
-      if(trajectory.size() > 100) { // Keep only last 100 points
+      // Update trajectory
+      Vec3d position = cameraPose.translation();
+      trajectory.emplace_back(Point3d(position));
+
+      // Keep trajectory manageable
+      if(trajectory.size() > 200) {
         trajectory.erase(trajectory.begin());
       }
 
       // Draw trajectory
       if(trajectory.size() > 1) {
-        viz::WPolyLine trajectory_widget(trajectory, viz::Color::green());
-        window.showWidget("TRAJECTORY", trajectory_widget);
+        viz::WPolyLine trajectoryWidget(trajectory, viz::Color::green());
+        window.showWidget("TRAJECTORY", trajectoryWidget);
       }
 
-      // Add a sphere at current position
-      viz::WSphere current_pos(Point3d(accT), 0.02, 10, viz::Color::red());
-      window.showWidget("CURRENT_POS", current_pos);
+      // Mark current position
+      viz::WSphere currentPos(Point3d(position), 0.2, 10, viz::Color::red());
+      window.showWidget("CURRENT_POS", currentPos);
 
-      // Automatically adjust view to follow camera
-      Vec3d cam_pos(accT);
-      Vec3d viz_pos = cam_pos - Vec3d(0, -0.5, -2);
-      window.setViewerPose(
-          viz::makeCameraPose(viz_pos, cam_pos, Vec3d(0, -1, 0)));
-      window.spinOnce(1, true);
+      // Show position info
+      cout << "Frame: " << frameCount << " | Pos: [" << position[0] << ", "
+           << position[1] << ", " << position[2] << "]"
+           << " | Success: " << successCount << "/" << frameCount << endl;
 
-      cout << "Camera Position: x=" << accT.at< double >(0)
-           << " y=" << accT.at< double >(1) << " z=" << accT.at< double >(2)
-           << endl;
+      // Reset skip counter on success
+      skipCount = 0;
+    } else {
+      skipCount++;
+
+      // If we're skipping too many frames, try to reinitialize
+      if(skipCount > 5) {
+        cout << "Reinitializing tracking after " << skipCount
+             << " skipped frames" << endl;
+        prevPoints.clear(); // Force redetection of features
+        skipCount = 0;
+      }
     }
 
-    end = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration< double >(end - start).count();
-    fps = 1.0 / elapsed;
+    // Update viz window
+    window.spinOnce(1, true);
 
-    // Display original frame with FPS
+    // Calculate elapsed time and FPS
+    auto endTime = std::chrono::high_resolution_clock::now();
+    double elapsed
+        = std::chrono::duration< double >(endTime - startTime).count();
+    double currentFps = 1.0 / elapsed;
+    startTime = endTime;
+
+    // Display info on frame
     putText(currentFrame,
-            "FPS: " + std::to_string(fps),
+            "FPS: " + std::to_string(int(currentFps))
+                + " | Frame: " + std::to_string(frameCount)
+                + " | Success: " + std::to_string(successCount) + "/"
+                + std::to_string(frameCount),
             Point(10, 30),
             FONT_HERSHEY_SIMPLEX,
-            1,
+            0.7,
             Scalar(0, 255, 0),
             2);
 
+    // Show frames
     imshow("Video Feed", currentFrame);
 
+    // Check for user input
     int key = waitKey(1);
-    if(key == 27) { // ESC
+    if(key == 27) { // ESC to exit
       break;
+    } else if(key == ' ') { // Space to pause
+      waitKey(0);
     }
 
+    // Update frames
     previousFrame = currentFrame.clone();
     frameCount++;
   }
 
+  cout << "Video processing complete. Processed " << frameCount
+       << " frames with " << successCount << " successful tracks ("
+       << (successCount * 100.0 / frameCount) << "%)" << endl;
+
+  waitKey(0);
   return 0;
 }
