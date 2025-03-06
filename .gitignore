@@ -315,4 +315,5 @@ $RECYCLE.BIN/
 .cache
 .vscode
 build
-data
+!data/get_test_vids.sh
+data/*.mp4
