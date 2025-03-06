@@ -5,8 +5,10 @@
 #include <iostream>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
+#include <opencv2/core/affine.hpp>
 #include <opencv2/core/base.hpp>
 #include <opencv2/core/mat.hpp>
+#include <opencv2/core/matx.hpp>
 #include <opencv2/core/types.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/highgui.hpp>
@@ -363,6 +365,9 @@ int main(int argc, char** argv) {
       // Update trajectory
       Vec3d position = cameraPose.translation();
       trajectory.emplace_back(Point3d(position));
+
+      Affine3d backwardPose = cameraPose.translate(Vec3d(0, 0, -20));
+      window.setViewerPose(backwardPose);
 
       // Keep trajectory manageable
       if(trajectory.size() > 200) {
