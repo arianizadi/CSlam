@@ -366,8 +366,10 @@ int main(int argc, char** argv) {
       Vec3d position = cameraPose.translation();
       trajectory.emplace_back(Point3d(position));
 
-      Affine3d backwardPose = cameraPose.translate(Vec3d(0, 0, -20));
-      window.setViewerPose(backwardPose);
+      Vec3d camPos = cameraPose.translation();
+      Vec3d topPos = camPos + Vec3d(0, 20, 0); // 20 units above
+      Affine3d topView = viz::makeCameraPose(topPos, camPos, Vec3d(0, 0, 1));
+      window.setViewerPose(topView);
 
       // Keep trajectory manageable
       if(trajectory.size() > 200) {
